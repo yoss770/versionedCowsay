@@ -1,0 +1,87 @@
+pipeline {
+  agent any
+  options {
+    gitLabConnection('gitlab connection')
+  }
+  triggers {
+    gitlab(
+      triggerOnPush: true,
+      triggerOnMergeRequest: true,
+      branchFilterType: 'All',
+      addVoteOnMergeRequest: true)
+  }
+  parameters {
+    string(name: 'VERSION', defaultValue: 'EOS')
+  }
+  stages {
+    stage('createVersion') {
+      when {
+        expression { (env.GIT_BRANCH == 'master' && params.VERSION != 'EOS') || env.GIT_BRANCH ==~ /release\/.*/}
+      }
+      steps {
+        script {
+          if (params.VERSION == "EOS") {
+            ver = sh(script: "echo ${env.GIT_BRANCH} | cut -d / -f 2", returnStdout: true).trim()
+            params.VERSION = ver
+          }
+          exitcode = sh(script: "git checkout release/${params.VERSION}", returnStatus: true)
+          echo "${exitcode}"
+          if (exitcode) {
+          sh """
+            git checkout -b release/${params.VERSION}
+            echo ${params.VERSION} >> v.txt
+            git commit v.txt -m "release version"
+            git push -u origin release/${params.VERSION}
+          """
+          }
+            
+          lasttag = sh(script: "git tag -l --sort=version:refname \"v${params.VERSION}.*\" | tail -1", returnStdout: true).trim()
+          def newtag
+          if (lasttag.isEmpty()) {
+            sh "git tag v${params.VERSION}.0"
+            newtag = "v${params.VERSION}.0"
+          } else {
+            newtag = lasttag.split('\\.')
+            newtag[2] = newtag[2].toInteger() + 1
+            newtag = newtag.join('.')
+            sh "git tag ${newtag}"
+          }
+          NEWTAG = newtag
+        }
+      }
+    }
+    stage('Build') {
+      steps {
+        echo '******building app...******'
+        sh "docker build -t cowsay_app:${env.GIT_COMMIT} ."
+      }
+    }
+    stage('Testing'){
+      steps {
+        echo '******testing app...******'
+        sh "docker run -d --name cowsay_jenkins --network=jenkinscowsay_jenkins_cowsay_network -p 8082:8082 cowsay_app:${env.GIT_COMMIT}"
+        sh 'sleep 5'
+        sh 'curl cowsay_jenkins:8082'
+      }
+    }
+    stage('Publish') {
+      when {
+        expression { (env.GIT_BRANCH == 'master' && params.VERSION != 'EOS') || env.GIT_BRANCH ==~ /release\/.*/}
+      }
+      steps {
+        withDockerRegistry(credentialsId: 'ecr:us-east-2:jenkins_aws', url: 'https://940900938199.dkr.ecr.us-east-2.amazonaws.com') {
+          sh "docker tag cowsay_app:${env.GIT_COMMIT} 940900938199.dkr.ecr.us-east-2.amazonaws.com/cowsay:${NEWTAG}"
+          sh "docker push 940900938199.dkr.ecr.us-east-2.amazonaws.com/cowsay:${NEWTAG}"
+        }
+        sh "git push --tags"
+      }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
+      sh 'docker rm -f cowsay_jenkins || true'
+    }
+  }
+}
